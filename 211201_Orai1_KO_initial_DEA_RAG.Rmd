@@ -1829,4 +1829,69 @@ CairoPDF("~/Prakriya_Orai1_astro/data/221013_Ora1_Stim_barplots.pdf",
     family = "Arial")
 orai_stim_barplots
 dev.off()
+```   
+   
+# SRA upload   
+## Merge by lane   
+   
+~/Prakriya_Orai1_astro/rgrant/230209_fastq_merge_sra.sh   
+   
+## Output metadata
+```{r}
+merged_files = list.files("/projects/b1038/Pulmonary/rgrant/Orai1_KO_Prakriya/merged_fastqs", 
+                          pattern = ".fastq.gz$",
+                          full.names = T) %>% 
+  as_tibble() %>% 
+  dplyr::rename(fastq_1 = value) %>% 
+  dplyr::mutate(sample = gsub("_merged_R1_001.fastq.gz", "", basename(fastq_1)))
+
+sra_md_files = nfcore_ss %>% 
+  dplyr::select(-fastq_1) %>% 
+  unique() %>% 
+  left_join(., merged_files) %>% 
+  left_join(., ss) %>% 
+  #remove uRNA control
+  dplyr::filter(Description != "uRNA115ng") %>% 
+  dplyr::mutate(organism = "Mus musculus",
+                strain = case_when(genotype == "Wild-Type" ~ "Orai1-flox/flox (Jax 036232)",
+                                   genotype == "Orai1 KO" ~ "Gfap-Cre (Jax 0l2887) x Orai1-flox/flox (Jax 036232)"),
+                dev_stage = "P0-P4",
+                sex = "not determined",
+                tissue = "brain, hippocampus",
+                sample_type = "cultured primary astrocytes",
+                sequencing_lane = case_when(grepl("L001", fastq_1) ~ 1,
+                                            grepl("L002", fastq_1) ~ 2,
+                                            grepl("L003", fastq_1) ~ 3,
+                                            grepl("L004", fastq_1) ~ 4),
+                library_strategy = "RNA-seq",
+                library_source = "TRANSCRIPTOMIC", 
+                library_selection = "PCR", 
+                library_layout = "single", 
+                platform = "ILLUMINA", 
+                instrument_model = "NextSeq 500", 
+                design_description = "mRNA was isolated from purified 50 ng total RNA using oligo-dT beads (New England Biolabs, Inc). NEBNext Ultra™ RNA kit was used for full-length cDNA synthesis and library preparation. Libraries were pooled, denatured and diluted, resulting in a 1.8 pM DNA solution. PhiX control was spiked at 1%. Libraries were sequenced on an Illumina NextSeq 500 instrument (Illumina Inc) using NextSeq 500 High Output reagent kit (Illumina Inc) (1x75 cycles). FASTQ files were generated using bcl2fastq 2.19.1 (Illumina).", 
+                filetype = "fastq", 
+                filename = fastq_1) %>% 
+  dplyr::select(sample_name = sample, mouse = Description, organism, strain, dev_stage, sex, tissue, sample_type, 
+                treatment, genotype, filename, sequencing_lane, library_ID = sample, title = sample, library_strategy,
+                library_source, library_selection, library_layout, platform, instrument_model, design_description,
+                filetype)
+
+sra_md = sra_md_files %>% 
+  dplyr::select(-c(filename, sequencing_lane, library_ID, title, library_strategy,
+                library_source, library_selection, library_layout, platform, instrument_model, design_description,
+                filetype)) %>% 
+  unique()
+
+write.table(sra_md_files, file = "~/Prakriya_Orai1_astro/data/230109_SRA_md_files.tsv", row.names=FALSE, sep="\t")
+write.table(sra_md, file = "~/Prakriya_Orai1_astro/data/230109_SRA_md.tsv", row.names=FALSE, sep="\t")
+```   
+   
+### Aspera upload   
+```{bash eval=FALSE}
+module load aspera/3.10.0
+cd /projects/b1038/Pulmonary/rgrant/Orai1_KO_Prakriya/merged_fastqs
+screen
+
+ascp -i '/home/rag0151/aspera.openssh' -QT -l100m -k1 -d . subasp@upload.ncbi.nlm.nih.gov:uploads/rogangrant_gmail.com_JcV2G4A1
 ```
