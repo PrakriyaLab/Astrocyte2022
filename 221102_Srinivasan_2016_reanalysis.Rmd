@@ -1,0 +1,236 @@
+---
+title: "Srinivasan (2016) astrocyte LPS treatment reanalysis"
+output: html_notebook
+---
+
+# Setup  
+## Goals    
+   
+Reanalyze Srinivasan et al., Nat Comm (2016) to determine LPS response of astrocytes   
+   
+## Load packages   
+```{r setup}
+library(tidyverse)
+library(readxl)
+library(ggplot2)
+library(DESeq2)
+library(parallel)
+library(doParallel)
+library(BiocParallel)
+library(biomaRt)
+library(pheatmap)
+library(RColorBrewer)
+library(ggsci)
+library(ggsignif)
+library(ggrepel)
+library(Cairo)
+library(UpSetR)
+
+
+registerDoParallel(makeCluster(12))
+register(MulticoreParam(12))
+
+source("~/utils/R/k_means_figure.R")
+source("~/utils/R/plotPCA_manual.R")
+source("~/utils/R/get_tidy_counts.R")
+source("~/utils/R/pretty_MA_plot.R")
+```
+   
+# Process dataset   
+## Download   
+### Get accessions
+```{bash eval=FALSE}
+cd /projects/b1042/MisharinLab/rgrant/
+mkdir srinivasan_reanalysis
+cd srinivasan_reanalysis
+
+#accession list and metadata downloaded from https://www.ncbi.nlm.nih.gov/Traces/study/?acc=PRJNA302899&search=astrocyte&o=acc_s%3Aa&s=SRR2938962,SRR2938963,SRR2938968,SRR2938969,SRR2938972,SRR2938973,SRR2938977,SRR2938985
+# placed in folder using FTP
+sbatch /home/rag0151/Prakriya_Orai1_astro/rgrant/221102_srinivasan_download.sh
+```   
+   
+### Download script   
+   
+~/Prakriya_Orai1_astro/rgrant/221102_srinivasan_download.sh
+   
+```{bash eval=FALSE}
+#!/bin/bash
+#SBATCH -A b1042
+#SBATCH -p genomics
+#SBATCH -t 16:00:00
+#SBATCH -N 1
+#SBATCH --mem=48G
+#SBATCH --ntasks-per-node=8
+#SBATCH --mail-user=rogangrant2022@u.northwestern.edu
+#SBATCH --mail-type=BEGIN,END,FAIL
+#SBATCH --job-name="221102_srinivasan_download"
+
+cd /projects/b1042/MisharinLab/rgrant/srinivasan_reanalysis
+/home/rag0151/utils/bash/fastestQ_SRA.sh \
+'/projects/b1042/MisharinLab/rgrant/srinivasan_reanalysis/SRR_Acc_List.txt' \
+8 \
+/scratch/rag0151 \
+/projects/b1042/MisharinLab/rgrant/srinivasan_reanalysis/raw_data/
+```
+
+## Run pipeline   
+### Organize metadata   
+```{r}
+fastqs = list.files("/projects/b1042/MisharinLab/rgrant/srinivasan_reanalysis/raw_data", 
+                    pattern = "fast.+",
+                    full.names = T) %>% 
+  as_tibble() %>% 
+  dplyr::rename(fastq_1 = value) %>% 
+  dplyr::mutate(sample = gsub(".fast.+", "", basename(fastq_1)),
+                fastq_2 = NA)
+
+md = read.csv("/projects/b1042/MisharinLab/rgrant/srinivasan_reanalysis/SraRunTable.txt") %>% 
+  dplyr::select(sample = Run, treatment = Treatment) %>% 
+  dplyr::mutate(treatment = factor(treatment),
+                strandedness = "unstranded") %>% 
+  left_join(., fastqs) %>% 
+  dplyr::relocate(sample, fastq_1, fastq_2, strandedness)
+
+write_csv(md,
+          "/projects/b1042/MisharinLab/rgrant/srinivasan_reanalysis/221102_nfcore_samplesheet.csv",
+          na = "")
+```
+   
+### Run
+```{bash eval=FALSE}
+screen
+cd /projects/b1042/MisharinLab/rgrant/srinivasan_reanalysis
+module purge
+module load singularity
+module load graphviz/2.40.1
+module load java/jdk11.0.10
+
+nextflow run nf-core/rnaseq \
+-r '3.4' \
+-profile nu_genomics \
+--email 'rogangrant2022@u.northwestern.edu' \
+--genome 'GRCm38' \
+-work-dir '/scratch/rag0151' \
+--input '/projects/b1042/MisharinLab/rgrant/srinivasan_reanalysis/221102_nfcore_samplesheet.csv' \
+--outdir '/projects/b1042/MisharinLab/rgrant/srinivasan_reanalysis/results'
+```
+
+# DEA   
+## Import into DESeq (simple version)   
+```{r}
+#import gene conversion
+mouse_conv = read_tsv("/projects/b1042/MisharinLab/rgrant/srinivasan_reanalysis/results/star_salmon/salmon.merged.gene_counts_length_scaled.tsv") %>% 
+   dplyr::select(ensembl_gene_id = gene_id, external_gene_name = gene_name)
+
+#import des
+load("/projects/b1042/MisharinLab/rgrant/srinivasan_reanalysis/results/star_salmon/deseq2_qc/deseq2.dds.RData")
+tmp = colData(dds) %>% 
+   as.data.frame() %>%
+   dplyr::select(-sizeFactor)
+md_final = left_join(tmp, md) %>% 
+   column_to_rownames("sample")
+
+all(colnames(dds) == rownames(md_final)) #TRUE
+des = DESeqDataSetFromMatrix(countData = counts(dds, normalized = F), 
+                                  colData = md_final,
+                                  design = ~ treatment)
+```   
+   
+## PCA   
+```{r}
+pca = plotPCA_manual(object = vst(des), 
+                     intgroup = "treatment", 
+                     pcs = 3, 
+                     ntop = nrow(des),
+                     merge_metadata = TRUE,
+                     return_loadings = TRUE,
+                     custom_annotation = mouse_conv)
+
+ggplot(pca$data, aes(x = PC1, y = PC2, color = treatment)) +
+   geom_point(size = 4)  +
+   scale_color_npg() +
+   labs(x = paste0("PC1 (", pca$percent_var$percent_var[1], "% of variance explained)"),
+        y = paste0("PC2 (", pca$percent_var$percent_var[2], "% of variance explained)")) +
+   theme_bw(base_family = "Arial") +
+   scale_color_nejm()
+```  
+   
+Some of these samples are probably poor quality, but no real way of knowing this. LPS at least explains the plurality of the variation, but PC2 is probably some sort of nuisance factor.   
+   
+## Find best fit   
+```{r}
+parametric = DESeq(des,
+                   fitType = "parametric",
+                   parallel = T)
+plotDispEsts(parametric) #realistically this is pretty good
+
+local = DESeq(des,
+              fitType = "local",
+              parallel = T)
+plotDispEsts(local) #modestly better, keep
+
+dge = local
+
+saveRDS(dge, "~/Prakriya_Orai1_astro/data/221103_srinivasan_dge.rds")
+rm(local, parametric)
+```   
+   
+## Get hits   
+```{r}
+lps_res = results(dge, contrast = c("treatment", "lps", "vehicle"), alpha = 0.05, parallel = T)
+lps_hits = id_convert(lps_res, custom_annotation = mouse_conv)
+
+lps_up = lps_hits %>% 
+  dplyr::filter(padj < 0.05 & log2FoldChange > 0)
+lps_down = lps_hits %>% 
+  dplyr::filter(padj < 0.05 & log2FoldChange < 0)
+```
+   
+# Overlap with in-house hits   
+## Import in-house hits   
+```{r}
+orai1_ko_up = read.csv("~/Prakriya_Orai1_astro/data/211203_KO_hits_untreated.csv") %>% 
+  dplyr::filter(padj < 0.05 & log2FoldChange > 0)
+orai1_ko_down = read.csv("~/Prakriya_Orai1_astro/data/211203_KO_hits_untreated.csv") %>% 
+  dplyr::filter(padj < 0.05 & log2FoldChange < 0)
+
+treatment_up = read.csv("~/Prakriya_Orai1_astro/data/211203_treatment_hits_WT.csv") %>% 
+  dplyr::filter(padj < 0.05 & log2FoldChange > 0)
+treatment_down = read.csv("~/Prakriya_Orai1_astro/data/211203_treatment_hits_WT.csv") %>% 
+  dplyr::filter(padj < 0.05 & log2FoldChange < 0)
+
+combined_up = read.csv("~/Prakriya_Orai1_astro/data/211203_KOtreated_vs_WTtreated.csv") %>% 
+  dplyr::filter(padj < 0.05 & log2FoldChange > 0)
+combined_down = read.csv("~/Prakriya_Orai1_astro/data/211203_KOtreated_vs_WTtreated.csv") %>% 
+  dplyr::filter(padj < 0.05 & log2FoldChange < 0)
+```
+   
+## Upset plot   
+```{r}
+upset_list = list("Srinivasan_LPS_upregulated" = lps_up$external_gene_name, 
+                  "Srinivasan_LPS_downregulated" = lps_down$external_gene_name,
+                  "WT_treated_upregulated" = treatment_up$external_gene_name, 
+                  "WT_treated_downregulated" = treatment_down$external_gene_name)
+srinivasan_comp_upset = upset(fromList(upset_list))
+
+CairoPDF("~/Prakriya_Orai1_astro/data/221103_Srinivasan_upset.pdf",
+    width = 9,
+    height = 6,
+    family = "Arial")
+srinivasan_comp_upset
+dev.off()
+
+srinivasan_comp_upset               
+```   
+   
+## Output overlaps   
+```{r}
+overlaps_up = intersect(treatment_up$external_gene_name, lps_up$external_gene_name) %>% 
+  sort()
+write.csv(overlaps_up, "~/Prakriya_Orai1_astro/data/221103_lps_treatment_overlaps_up.csv")
+
+overlaps_down = intersect(treatment_down$external_gene_name, lps_down$external_gene_name) %>% 
+  sort()
+write.csv(overlaps_down, "~/Prakriya_Orai1_astro/data/221103_lps_treatment_overlaps_down.csv")
+```
+

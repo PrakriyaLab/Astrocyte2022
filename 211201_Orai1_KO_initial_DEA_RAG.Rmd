@@ -1,0 +1,1832 @@
+---
+title: "Orai1 initial DEA"
+output:
+  html_document:
+    df_print: paged
+---
+   
+# Setup   
+## Goals   
+   
+1. Determine the effects of Orai KO or SERCA block/ER stress (200nM thapsigargin and PKC/MAPK pathway activation (50nM PDBu) on bulk postnatal murine hippocampal culture gene expression   
+2. Set up a usable framework for further analysis   
+   
+## Import packages   
+```{r setup}
+library(DESeq2)
+library(tidyverse)
+library(parallel)
+library(doParallel)
+library(BiocParallel)
+library(pheatmap)
+library(readxl)
+library(uwot)
+library(factoextra)
+library(biomaRt)
+library(ggsci)
+library(Cairo)
+library(WGCNA)
+library(RColorBrewer)
+library(broom)
+library(ggsignif)
+library(fgsea)
+library(ggrepel)
+
+source("~/utils/R/k_means_figure.R")
+source("~/utils/R/pretty_MA_plot.R")
+source("~/utils/R/plotPCA_manual.R")
+source("~/utils/R/get_tidy_counts.R")
+source("~/utils/R/go_enrichment.R")
+source("~/utils/R/get_pairwise_DESeq.R")
+
+
+registerDoParallel(makeCluster(12))
+register(MulticoreParam(12))
+
+set.seed(12345)
+
+pal = c("#404040", "#e47d79", "#000000", "#ea3524")
+
+mouse_mart = useMart("ensembl", "mmusculus_gene_ensembl")
+```
+      
+# Sequence processing   
+## Sample sheet   
+   
+Sample sheet was already added to the directory :)      
+   
+## Generate fastq   
+~/Prakriya_Orai1_astro/211203_Orai1_bcl2fastq.sh
+```{bash eval=FALSE}
+#!/bin/bash
+#SBATCH -A b1042
+#SBATCH -p genomics
+#SBATCH -t 12:00:00
+#SBATCH -N 1
+#SBATCH --mem=48G
+#SBATCH --ntasks-per-node=12
+#SBATCH --mail-user=rogangrant2022@u.northwestern.edu
+#SBATCH --mail-type=BEGIN,END,FAIL
+#SBATCH --job-name='211203_Orai1_bcl2fastq'
+
+module purge
+cd /projects/b1038/Pulmonary/rgrant/Orai1_KO_Prakriya/211122_NB501488_0481_AH5JM2BGXK
+module load bcl2fastq/2.19.1 
+bcl2fastq --loading-threads 4 --writing-threads 4 --processing-threads 4
+```   
+   
+## Generate nf-core sample sheet   
+```{r}
+#get samples from file names, link to sample IDs
+ss = read_csv("~/Prakriya_Orai1_astro/data/PrakriyaLab_rnaseq_sample sheet.csv",
+              skip = 15, 
+              trim_ws = T, 
+              name_repair = "universal") %>% 
+   dplyr::select(-c(group.., Sample_Name, index:I5_Index_ID)) %>% 
+   dplyr::rename(sample = Sample_ID,
+                 combined = group) %>% 
+   mutate(combined = factor(combined),
+          genotype = factor(case_when(grepl("WT", combined) ~ "Wild-Type",
+                                      grepl("KO", combined) ~ "Orai1 KO",
+                                      TRUE ~ NA_character_)),
+          treatment = factor(case_when(grepl("untreated", combined) ~ "Vehicle",
+                                       grepl("treated", combined) ~ "200nM Thapsigargin + 50nM PDBu",
+                                       TRUE ~ NA_character_)))
+#import batch data and bind
+batch_data = read_csv("~/Prakriya_Orai1_astro/data/211203_Prakriya_batch_data.csv")
+ss = left_join(ss, batch_data)
+
+fastq_files = list.files(path = "/projects/b1038/Pulmonary/rgrant/Orai1_KO_Prakriya/211122_NB501488_0481_AH5JM2BGXK/Data/Intensities/BaseCalls/MW-Prakriya_Orai1_11-15-21/",
+                         pattern = "^MP.+\\.fastq\\.gz",
+                         recursive = T,
+                         full.names = T) %>% 
+   as_tibble() %>% 
+  #originally no column name, so add required one
+  dplyr::rename(fastq_1 = value) %>% 
+   #only single-end, so leave empty
+   mutate(fastq_2 = NA) %>% 
+  #location of the sample name in the file path
+   dplyr::mutate(sample = substring(text = fastq_1, 
+                                       first = regexpr(pattern = "MP", text = fastq_1), 
+                                       last = (regexpr(pattern = "S\\d+_L00\\d", text = fastq_1) -  2))) %>% 
+   mutate(strandedness = "unstranded") %>% 
+   #merge with sample sheet using "Sample_ID"
+   left_join(., ss) 
+
+nfcore_ss = fastq_files %>% 
+   dplyr::select(sample, fastq_1:strandedness)
+
+write_csv(nfcore_ss,
+          "~/Prakriya_Orai1_astro/data/211203_Prakriya_nfcore_sample_sheet.csv",
+          na = "")
+```
+   
+## Run pipe   
+```{bash eval=FALSE}
+screen
+cd /projects/b1038/Pulmonary/rgrant/Orai1_KO_Prakriya
+module purge
+module load singularity
+module load graphviz/2.40.1
+
+
+nextflow run nf-core/rnaseq \
+-r '3.4' \
+-profile nu_genomics \
+--email 'rogangrant2022@u.northwestern.edu' \
+--genome 'GRCm38' \
+-work-dir '/projects/b1042/MisharinLab/rgrant/scratch' \
+--input ~/Prakriya_Orai1_astro/data/211203_Prakriya_nfcore_sample_sheet.csv
+```
+   
+## Import into DESeq (simple version)   
+```{r}
+#import gene conversion
+mouse_conv = read_tsv("/projects/b1038/Pulmonary/rgrant/Orai1_KO_Prakriya/results/star_salmon/salmon.merged.gene_counts_length_scaled.tsv") %>% 
+   dplyr::select(ensembl_gene_id = gene_id, external_gene_name = gene_name)
+
+#import des
+load("/projects/b1038/Pulmonary/rgrant/Orai1_KO_Prakriya/results/star_salmon/deseq2_qc/deseq2.dds.RData") 
+dds = dds[, dds$sample != "MP_21_021"] #remove URNA, which we know from multiQC clusters out
+tmp = colData(dds) %>% 
+   as.data.frame() %>%
+   dplyr::select(-sizeFactor)
+md_final = left_join(tmp, ss) %>% 
+   column_to_rownames("sample") %>%
+   mutate(batch = factor(batch))
+
+all(colnames(dds) == rownames(md_final)) #TRUE
+des = DESeqDataSetFromMatrix(countData = counts(dds, normalized = F), 
+                                  colData = md_final,
+                                  design = ~ combined)
+```   
+   
+# Basic QC   
+## PCA   
+```{r}
+pca = plotPCA_manual(object = vst(des), 
+                     intgroup = "combined", 
+                     pcs = 3, 
+                     ntop = nrow(des),
+                     merge_metadata = TRUE,
+                     return_loadings = TRUE,
+                     custom_annotation = mouse_conv)
+
+ggplot(pca$data, aes(x = PC1, y = PC2, color = combined, shape = batch)) +
+   geom_point(size = 4)  +
+   scale_color_npg() +
+   labs(x = paste0("PC1 (", pca$percent_var$percent_var[1], "% of variance explained)"),
+        y = paste0("PC2 (", pca$percent_var$percent_var[2], "% of variance explained)")) +
+   theme_bw(base_family = "Arial") +
+   scale_color_nejm()
+ggplot(pca$data, aes(x = PC2, y = PC3, color = combined, shape = batch)) +
+   geom_point(size = 4) +
+   scale_color_npg() +
+   labs(x = paste0("PC2 (", pca$percent_var$percent_var[2], "% of variance explained)"),
+        y = paste0("PC3 (", pca$percent_var$percent_var[3], "% of variance explained)")) +
+   theme_bw(base_family = "Arial") +
+   scale_color_nejm()
+```  
+   
+PC1 is clearly treatment, and explains almost all of the variance in the data. Fairly limited separation by genotype that I can see. Need to confirm KO.    
+   
+   
+### Publication version   
+```{r}
+pca_publication = plotPCA_manual(object = vst(des, blind = F), 
+                     intgroup = "combined", 
+                     pcs = 3, 
+                     ntop = nrow(des),
+                     merge_metadata = TRUE,
+                     return_loadings = TRUE,
+                     custom_annotation = mouse_conv)
+pca_publication$data$biosample = rownames(pca_publication$data)
+
+pca_plot_publication = ggplot(pca_publication$data, aes(x = PC1, y = PC2, color = combined)) +
+   geom_point(size = 4)  +
+   scale_color_nejm(name = "Group") +
+   labs(x = paste0("PC1 (", pca$percent_var$percent_var[1], "% of variance explained)"),
+        y = paste0("PC2 (", pca$percent_var$percent_var[2], "% of variance explained)")) +
+   theme_bw(base_family = "Arial") 
+
+CairoPDF("~/Prakriya_Orai1_astro/data/220518_publication_pca.pdf",
+    width = 9,
+    height = 6,
+    family = "Arial")
+pca_plot_publication
+dev.off()
+
+```  
+   
+## Find best fit   
+```{r}
+parametric = DESeq(des,
+                   fitType = "parametric",
+                   parallel = T)
+plotDispEsts(parametric) #realistically this is pretty good
+
+local = DESeq(des,
+              fitType = "local",
+              parallel = T)
+plotDispEsts(local) #modestly better, keep
+
+dge = local
+
+saveRDS(dge, "~/Prakriya_Orai1_astro/data/220321_complete_dge.rds")
+rm(local, parametric)
+```
+   
+## Determine expression cutoff   
+### Plot expression vs coefficient of variation   
+```{r}
+expression_sum = data.frame(mean_expression = rowSums(counts(dge, normalized = T), na.rm = T),
+                            CV = rowSds(counts(dge, normalized = T), na.rm = T) / rowMeans(counts(dge, normalized = T), na.rm = T))
+
+ggplot(expression_sum, aes(x = mean_expression + 0.5, y = CV)) +
+  geom_point(alpha = 0.1) +
+  geom_density2d() +
+  scale_x_log10() +
+  geom_vline(xintercept = 10, linetype = 2) +
+  geom_rug(alpha = 0.01)
+```
+   
+Noise seems to drop off after a mean of 10 counts
+   
+### Apply cutoff and get gene list   
+```{r}
+expressed_genes = counts(dge, normalized = T) %>% 
+  as.data.frame() %>% 
+  .[rowSums(.) >= 10, ] %>% 
+  rownames()
+```
+   
+## Sanity checks   
+### Confirm KO      
+```{r}
+orai1 = get_tidy_counts(obj = dge, 
+                        goi = c("Orai1"), 
+                        goi_format = "external_gene_name", 
+                        custom_annotation = mouse_conv)
+ggplot(orai1, aes(x = combined, y = counts, fill = combined, label = sample)) +
+   facet_wrap(~external_gene_name, scales = "free_y") +
+   geom_boxplot(outlier.shape = NA) +
+   geom_point(position = position_jitter(seed = 12345, width = 0.2)) +
+   scale_fill_npg() +
+   theme_bw() +
+   theme(strip.background = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust=1),
+        legend.position = "none") +
+  geom_text(position = position_jitter(seed = 12345, width = 0.2)) +
+  labs(x = "", y = "Gene Counts")
+```
+Appears to be some compensation going on, or maybe just other cell types in culture express, but expression is clearly reduced 2-3 fold.   
+   
+# DEA   
+## KO, alone   
+### MA Plot   
+```{r}
+Orai1_res = results(dge,
+                    contrast = c("combined", "KO untreated", "WT untreated"),
+                    alpha = 0.05,
+                    parallel = T)
+
+Orai1_hits = id_convert(Orai1_res, custom_annotation = mouse_conv)
+write.csv(Orai1_hits, "~/Prakriya_Orai1_astro/data/211203_KO_hits_untreated.csv")
+
+Orai1_res_shrink = lfcShrink(dge, contrast = c("combined", "KO untreated", "WT untreated"),
+                                   res = Orai1_res, parallel = T, type = "ashr")
+
+Orai1_hits = Orai1_res %>% 
+   as.data.frame() %>% 
+   dplyr::filter(padj < 0.05) %>% 
+   arrange(desc(log2FoldChange)) %>% 
+   id_convert(results = ., custom_annotation = mouse_conv)
+
+Orai1_ma = pretty_MA_plot(results = Orai1_res_shrink, custom_annotation = mouse_conv,
+                          label_text_size = (16 / .pt)) +
+   theme_bw(base_family = "Arial", base_size = 16) +
+   theme(legend.position = "none")
+Orai1_ma
+
+CairoPDF("~/Prakriya_Orai1_astro/data/211203_Orai1_MA_untreated.pdf",
+    width = 9,
+    height = 6,
+    family = "Arial")
+Orai1_ma
+dev.off()
+```
+   
+Very clean, but nothing beyond expected. Orai1 is downregulated the expected 2-3 fold, nothing else really changed.   
+         
+## Treatment, alone   
+### MA Plot   
+```{r}
+treatment_res = results(dge,
+                    contrast = c("combined", "WT treated", "WT untreated"),
+                    alpha = 0.05,
+                    parallel = T)
+
+treatment_hits = id_convert(treatment_res, custom_annotation = mouse_conv)
+write.csv(treatment_hits, "~/Prakriya_Orai1_astro/data/211203_treatment_hits_WT.csv")
+
+treatment_res_shrink = lfcShrink(dge, contrast = c("combined", "WT treated", "WT untreated"),
+                                   res = treatment_res, parallel = T, type = "ashr")
+
+treatment_hits = treatment_res %>% 
+   as.data.frame() %>% 
+   dplyr::filter(padj < 0.05) %>% 
+   arrange(desc(log2FoldChange)) %>% 
+   id_convert(results = ., custom_annotation = mouse_conv)
+
+# treatment_goi = getBM(attributes = c("ensembl_gene_id", "external_gene_name"),
+#                      filters = "go",
+#                      values = c("GO:0071347"), #cellular response to IL-1
+#                      mart = mouse_mart) %>%
+#   #remove un-annotated genes
+#   dplyr::filter(!grepl("^Gm\\d+", external_gene_name) & !is.na(external_gene_name)) %>%
+#    unique() %>%
+#    dplyr::filter(ensembl_gene_id %in% treatment_hits$row.names)
+# 
+# treatment_hits_of_interest = treatment_hits %>% 
+#    dplyr::filter(grepl("^Il\\d|^Ccl|^Cxcl|^Irf|^Ifi|^Ifn|^Tnf", external_gene_name))
+
+treatment_goi = c("Il12a", "Cxcl3", "Ccl4", "Ccl20", "Il1a",
+                  "Tnf", "Ccl5", "Il1rl1", "Cd40", "Ccl3",
+                  "Il33", "Il6", "Cxcl10", "Il4ra", "Nfkb1",
+                  "Il1r1", "Ccl2", "Rela", "Cxcl1", "Cxcl2",
+                  "Il1r2", "Ccl8", "Il17rd", "Inhbb", "Il11ra1",
+                  "Il17rc")
+
+treatment_ma = pretty_MA_plot(results = treatment_res_shrink, 
+                              custom_annotation = mouse_conv,
+                              genes = intersect(treatment_hits$external_gene_name, treatment_goi),
+                              label_text_size = (16 / .pt),
+                              max_overlaps = 40) +
+   theme_bw(base_family = "Arial", base_size = 16) +
+   theme(legend.position = "none") +
+  ylim(-7.5, 10)
+
+treatment_ma
+
+CairoPDF("~/Prakriya_Orai1_astro/data/211203_treatment_MA_WT.pdf",
+    width = 9,
+    height = 6,
+    family = "Arial")
+treatment_ma
+dev.off()
+```   
+   
+Unsurprisingly, this perturbs the better part of the transcriptome. A total of `r nrow(treatment_hits)` genes are differentially expressed. Better to just look at the CSV in this case. Upregulated include a number of pro-inflammatory cytokines/signaling molecules (Cxcl2, Areg, Csf2), genes involved in maintaining a stem-like state or inibiting differentiation (Il11, LIF), and some potential astrocyte markers interestingly, including Aqp4? Canx, Calr, and HSPA5 are all up, which shows clear ER stress. Nothing immediately jumps out from downregulated genes, except Nanog, which again points to some shift in differentiation potential. Possible there are just some differentiating cells in these cultures which are perturbed by treatment alone or downstream inflammation.   
+   
+### GO analysis      
+```{r eval=FALSE}
+treatment_go_up = go_enrichment(dge, 
+                                goi = subset(treatment_hits, log2FoldChange > 0)$row.names, 
+                                return_fold_enrichment = T,
+                                expression_cutoff = 10)
+write.csv(treatment_go_up, "~/Prakriya_Orai1_astro/data/211203_treatment_wt_GO_up.csv")
+
+treatment_go_down = go_enrichment(dge, 
+                                  goi = subset(treatment_hits, log2FoldChange < 0)$row.names, 
+                                  return_fold_enrichment = T,
+                                expression_cutoff = 10)
+write.csv(treatment_go_down, "~/Prakriya_Orai1_astro/data/211203_treatment_wt_GO_down.csv")
+```
+      
+Upregulated genes have strong RNA metabolism signature, as well as upregulation of cell survival pathways and protein folding machinery. Latter two make a lot of sense. Downregulated genes have strong signature of cytoskeletal remodeling and lipid metabolism, metabolism in general. This may just be a shift toward focus on protein quality control? I haven't looked at this treatment much in the past.   
+   
+## Treatment::Genotype   
+### MA Plot   
+```{r}
+interaction_res = results(dge,
+                    contrast = c("combined", "KO treated", "WT treated"),
+                    alpha = 0.05,
+                    parallel = T)
+
+interaction_res_shrink = lfcShrink(dge, contrast = c("combined", "KO treated", "WT treated"),
+                                   res = interaction_res, parallel = T, type = "ashr")
+
+interaction_hits = id_convert(interaction_res_shrink, custom_annotation = mouse_conv)
+write.csv(interaction_hits, "~/Prakriya_Orai1_astro/data/211203_KOtreated_vs_WTtreated.csv")
+
+interaction_hits = interaction_res %>% 
+   as.data.frame() %>% 
+   dplyr::filter(padj < 0.05) %>% 
+   arrange(desc(log2FoldChange)) %>% 
+   id_convert(results = ., custom_annotation = mouse_conv)
+
+# interaction_goi = getBM(attributes = c("ensembl_gene_id", "external_gene_name"),
+#                      filters = "go",
+#                      values = c("GO:0006457", #protein folding
+#                                 "GO:0071347"), #cellular response to IL-1
+#                      mart = mouse_mart) %>% 
+#   #remove un-annotated genes
+#   dplyr::filter(!grepl("^Gm\\d+", external_gene_name) & !is.na(external_gene_name)) %>% 
+#    unique() %>% 
+#    dplyr::filter(ensembl_gene_id %in% interaction_hits$row.names)
+
+interaction_goi = c("Ccl28", "Orai1", "Nfkbib", "Nfrkb", "Nfatc1",
+                  "Nfkbie", "Camkk1", "Tollip", "Cxcl2", "Nfkb1",
+                  "Il1r1", "Chuk")
+
+interaction_ma = pretty_MA_plot(results = interaction_res_shrink, 
+                                custom_annotation = mouse_conv,
+                                genes = interaction_goi,
+                                label_text_size = (16 / .pt),
+                                max_overlaps = 50) +
+   theme_bw(base_family = "Arial", base_size = 16) +
+   theme(legend.position = "none") +
+  ylim(-4, 4)
+interaction_ma
+
+CairoPDF("~/Prakriya_Orai1_astro/data/211203_KOtreated_vs_WTtreated_MA.pdf",
+    width = 9,
+    height = 6,
+    family = "Arial")
+interaction_ma
+dev.off()
+```   
+   
+These are somewhat esoteric to me, better left to you. One thing that does jump out to me: the KO mounts less of a heat-shock-like response. 
+   
+## KO, treated vs untreated   
+### MA Plot   
+```{r}
+KO_treatment_res = results(dge,
+                    contrast = c("combined", "KO treated", "KO untreated"),
+                    alpha = 0.05,
+                    parallel = T)
+
+KO_treatment_res_shrink = lfcShrink(dge, contrast = c("combined", "KO treated", "KO untreated"),
+                                   res = KO_treatment_res, parallel = T, type = "ashr")
+
+KO_treatment_hits = id_convert(KO_treatment_res_shrink, custom_annotation = mouse_conv)
+write.csv(KO_treatment_hits, "~/Prakriya_Orai1_astro/data/211203_KOtreated_vs_KOuntreated.csv")
+
+KO_treatment_hits = KO_treatment_res %>% 
+   as.data.frame() %>% 
+   dplyr::filter(padj < 0.05) %>% 
+   arrange(desc(log2FoldChange)) %>% 
+   id_convert(results = ., custom_annotation = mouse_conv)
+
+KO_treatment_ma = pretty_MA_plot(results = KO_treatment_res_shrink, 
+                                custom_annotation = mouse_conv,
+                                label_text_size = (16 / .pt),
+                                max_overlaps = 50) +
+   theme_bw(base_family = "Arial", base_size = 16) +
+   theme(legend.position = "none") +
+  ylim(-4, 4)
+KO_treatment_ma
+
+CairoPDF("~/Prakriya_Orai1_astro/data/211203_KOtreated_vs_KOuntreated_MA.pdf",
+    width = 9,
+    height = 6,
+    family = "Arial")
+KO_treatment_ma
+dev.off()
+```   
+   
+### GO analysis      
+```{r eval=FALSE}
+interaction_go_up = go_enrichment(dge, 
+                                  goi = subset(treatment_hits, log2FoldChange > 0)$row.names, 
+                                  return_fold_enrichment = T,
+                                expression_cutoff = 10)
+write.csv(interaction_go_up, "~/Prakriya_Orai1_astro/data/211203_tKOtreated_vs_WTtreated_GO_up.csv")
+
+interaction_go_down = go_enrichment(dge, 
+                                    goi = subset(treatment_hits, log2FoldChange < 0)$row.names, 
+                                    return_fold_enrichment = T,
+                                expression_cutoff = 10)
+write.csv(interaction_go_down, "~/Prakriya_Orai1_astro/data/211203_KOtreated_vs_WTtreated_GO_down.csv")
+```   
+   
+Up: cytoskeletal reorganization. Down: RNA metabolism / transcription?   
+   
+### Heatmap of all hits across "combined" group (genotype and treatment)   
+   
+Optimize k   
+   
+```{r}
+elbow = k_elbow(dge, design = "~ combined", cores = 12)
+elbow
+```   
+   
+4 looks reasonable, and makes sense with 4 conditions.   
+   
+Generate plot and save   
+```{r eval=FALSE}
+k_means = k_means_figure(dge = dge,
+                         design = "~ combined",
+                         fitType = "local",
+                         k = 3,
+                         go_annotations = "org.Mm.eg.db",
+                         ensembl_db = "mmusculus_gene_ensembl",
+                         customAnno = mouse_conv,
+                         annoJoinCol = "ensembl_gene_id",
+                         legend_factors = c("genotype", "treatment"),
+                         breaks = seq(-2, 2, length.out=101),
+                         cores = 1,
+                         return_genes = T,
+                         display_go_terms = F,
+                         return_go_terms = T,
+                         cluster_columns = T,
+                         show_rownames = F,
+                         qval_cutoff = 0.05,
+                         tidy_go = T)
+
+saveRDS(k_means, "~/Prakriya_Orai1_astro/data/211203_combined_kmeans.rds")
+write.csv(k_means$genes, "~/Prakriya_Orai1_astro/data/211203_kmeans_gene_assignments.csv")
+write.csv(k_means$GO, "~/Prakriya_Orai1_astro/data/211203_kmeans_GO_enrichment.csv")
+CairoPDF("~/Prakriya_Orai1_astro/data/211203_complete_kmeans.pdf",
+    width = 8,
+    height = 6,
+    family = "Arial")
+k_means$plot
+dev.off()
+```
+   
+Plot   
+   
+```{r}
+k_means = readRDS("~/Prakriya_Orai1_astro/data/211203_combined_kmeans.rds")
+k_means$plot
+```
+   
+As expected, driven almost entirely by treatment. Still no obvious batch effect.   
+   
+# IL1 signaling   
+## Il1a and Il1b   
+```{r}
+il1_counts = get_tidy_counts(dge, goi = c("Il1a", "Il1b", "Gfap"), custom_annotation = mouse_conv, goi_format = "external_gene_name")
+
+ggplot(il1_counts, aes(x = combined, y = counts, fill= combined)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.2) +
+  facet_wrap(~ external_gene_name, scales = "free_y") +
+  #scale_y_log10() +
+  theme_bw() +
+  theme(legend.position = "none") +
+  scale_fill_npg() +
+  labs(x = "Group", y = "Gene Counts")
+```
+   
+Really low expression, and frankly not terribly different. Better to look at response?   
+   
+## IL1 response gene expression   
+### Make metagene   
+```{r}
+il1_response = getBM(attributes = c("ensembl_gene_id", "external_gene_name"),
+                     filters = "go",
+                     values = "GO:0071347", 
+                     mart = mouse_mart) %>% 
+  #remove un-annotated genes
+  dplyr::filter(!grepl("^Gm\\d+", external_gene_name))
+```   
+   
+### Summarize counts by sum   
+```{r}
+md = colData(dge) %>% 
+  as_tibble(rownames = NA) %>% 
+  rownames_to_column("sample")
+
+il1_response_counts = counts(dge, normalized = T) %>% 
+  as_tibble(rownames = NA) %>% 
+  rownames_to_column("ensembl_gene_id") %>% 
+  right_join(il1_response) %>% 
+  pivot_longer(cols = starts_with("MP_"),
+               names_to = "sample",
+               values_to = "counts") %>% 
+  left_join(., md)
+
+#now sum by sample
+il1_response_sums = il1_response_counts %>% 
+  group_by(sample, combined, genotype, treatment) %>% 
+  dplyr::summarize(il1_response_sum = sum(counts, na.rm = T))
+
+#write to csv for later use
+write.csv(il1_response_sums, "~/Prakriya_Orai1_astro/data/220223_il1_response_sums.csv")
+```   
+   
+Compare means   
+```{r}
+hist(il1_response_sums$il1_response_sum)
+shapiro.test(il1_response_sums$il1_response_sum)
+```   
+   
+Use nonparametric for safety   
+   
+```{r}
+kruskal.test(il1_response_sum ~ combined, data = il1_response_sums) #significant!'
+
+il1_response_comps = pairwise.wilcox.test(x = il1_response_sums$il1_response_sum, 
+                                          g = il1_response_sums$combined, 
+                                          p.adjust.method = "fdr") %>% 
+  tidy() %>% 
+  dplyr::filter(p.value < 0.05) %>% 
+  dplyr::mutate(y = seq(from = 125e3, by = 5000, length.out = nrow(.)),
+                annot = paste("P = ", signif(p.value, 2)))
+
+il1_response_comps
+```
+
+   
+Plot   
+```{r}
+ggplot(il1_response_sums, aes(x = combined, y = il1_response_sum, fill = combined)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.2) +
+  #scale_y_log10() +
+  theme_bw() +
+  theme(legend.position = "none") +
+  scale_fill_npg() +
+  labs(x = "Group", y = "Summed IL1 Response") +
+  geom_signif(inherit.aes = F, 
+              data = il1_response_comps,
+              aes(xmin = group2, xmax = group1, annotations = annot, y_position = y),
+              tip_length = 0,
+              manual=TRUE)
+```
+   
+### Summarize counts by z-score   
+   
+This gives genes more equal weight, less bias toward high-expression genes   
+   
+```{r}
+#now sum by sample
+il1_response_zscores = il1_response_counts %>% 
+  dplyr::filter(ensembl_gene_id %in% expressed_genes) %>% 
+  group_by(external_gene_name) %>% 
+  dplyr::mutate(zscore = scale(counts)) %>% 
+  ungroup() %>% 
+  group_by(sample, combined, genotype, treatment) %>% 
+  dplyr::summarize(mean_zscore = mean(zscore, na.rm = T))
+
+#write to csv for later use
+write.csv(il1_response_zscores, "~/Prakriya_Orai1_astro/data/220223_il1_response_zscores.csv")
+```
+   
+Compare means   
+```{r}
+hist(il1_response_zscores$mean_zscore, n = 10)
+shapiro.test(il1_response_zscores$mean_zscore)
+```   
+   
+Can use parametric, as would be expected for z-scaling        
+   
+```{r}
+oneway.test(mean_zscore ~ combined, data = il1_response_zscores)
+
+il1_response_comps = pairwise.t.test(x = il1_response_zscores$mean_zscore, 
+                                          g = il1_response_zscores$combined, 
+                                          p.adjust.method = "fdr") %>% 
+  tidy() %>% 
+  dplyr::filter(p.value < 0.05) %>% 
+  dplyr::mutate(y = seq(from = 125e3, by = 5000, length.out = nrow(.)),
+                annot = paste("P = ", signif(p.value, 2)))
+
+il1_response_comps
+```
+   
+Plot   
+```{r}
+ggplot(il1_response_zscores, aes(x = combined, y = mean_zscore, fill = combined)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.2) +
+  #scale_y_log10() +
+  theme_bw() +
+  theme(legend.position = "none") +
+  scale_fill_npg() +
+  labs(x = "Group", y = "Mean z-Normalized IL1 Response")
+  # geom_signif(inherit.aes = F, 
+  #             data = il1_response_comps,
+  #             aes(xmin = group2, xmax = group1, annotations = annot, y_position = y),
+  #             tip_length = 0,
+  #             manual=TRUE)
+```   
+   
+Similar trends, but much more limited range of signal.   
+   
+### Heatmap of all significantly variable genes (LRT) in IL1 response   
+   
+Get LRT hits   
+```{r}
+lrt_dge = DESeq(dge, 
+                test = "LRT", 
+                fitType = "local", 
+                full = ~ combined,
+                reduced = ~ 1) #intercept, alone
+lrt_hits = results(lrt_dge) %>% 
+  as.data.frame() %>% 
+  dplyr::filter(padj < 0.05)
+```
+   
+Subset and plot   
+```{r}
+il1_response_mat = il1_response_counts %>% 
+  dplyr::filter(ensembl_gene_id %in% rownames(lrt_hits)) %>% 
+  dplyr::arrange(desc(genotype), desc(treatment)) %>% 
+  pivot_wider(id_cols = external_gene_name, names_from = sample, values_from = counts) %>% 
+  column_to_rownames("external_gene_name") %>% 
+  #filter to expressed genes
+  dplyr::filter(rowMeans(., na.rm = T) >= 5) %>% 
+  data.matrix()
+
+#log-scale? 
+# il1_response_mat = il1_response_mat + 0.5
+# il1_response_mat = log10(il1_response_mat)
+
+il1_response_md = md_final %>% 
+  dplyr::select(genotype, treatment)
+
+il1_response_hm = pheatmap(mat = il1_response_mat,
+                           clustering_method = "ward.D2",
+                           scale = "row",
+                           cluster_cols = F,
+                           show_colnames = F,
+                           show_rownames = T,
+                           color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(101),
+                           breaks = seq(-3, 3, length.out=101),
+                           annotation_col = il1_response_md)
+
+CairoPDF("~/Prakriya_Orai1_astro/data/220306_combined_IL1_sig_hits.pdf",
+    width = 9,
+    height = 6,
+    family = "Arial")
+il1_response_hm
+dev.off()
+```
+   
+### Heatmap of all expressed genes in IL1 response   
+   
+Subset and plot   
+```{r}
+il1_response_mat = il1_response_counts %>% 
+  dplyr::filter(ensembl_gene_id %in% expressed_genes) %>% 
+  dplyr::arrange(desc(genotype), desc(treatment)) %>% 
+  pivot_wider(id_cols = external_gene_name, names_from = sample, values_from = counts) %>% 
+  column_to_rownames("external_gene_name") %>% 
+  data.matrix()
+
+#log-scale? 
+# il1_response_mat = il1_response_mat + 0.5
+# il1_response_mat = log10(il1_response_mat)
+
+il1_response_md = md_final %>% 
+  dplyr::select(genotype, treatment)
+
+il1_response_hm = pheatmap(mat = il1_response_mat,
+                           clustering_method = "ward.D2",
+                           scale = "row",
+                           cluster_cols = F,
+                           show_colnames = F,
+                           show_rownames = T,
+                           color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(101),
+                           breaks = seq(-3, 3, length.out=101),
+                           annotation_col = il1_response_md)
+
+CairoPDF("~/Prakriya_Orai1_astro/data/220310_IL1_expressed.pdf",
+    width = 9,
+    height = 8,
+    family = "Arial")
+il1_response_hm
+dev.off()
+```
+   
+### All expressed with k-means   
+   
+Determine k   
+```{r}
+expressed_il1_response = il1_response %>% 
+  dplyr::filter(ensembl_gene_id %in% expressed_genes) %>% 
+  .$ensembl_gene_id %>% 
+  unique()
+
+k_elbow(dge,
+        qval_cutoff = 1, 
+        genes_of_interest = expressed_il1_response, 
+        design = ~ combined,
+        cores = 4)
+```
+   
+4 seems like a good start.   
+    
+```{r eval=F}
+il1_kmeans = k_means_figure(dge, 
+                            qval_cutoff = 1, 
+                            genes_of_interest = expressed_il1_response, 
+                            design = ~ combined, 
+                            k = 4, 
+                            display_go_terms = F,
+                            return_go_terms = T, 
+                            cores = 1, 
+                            legend_factors = c("treatment", "genotype"), 
+                            cluster_columns = F, 
+                            sortColumns = T,
+                            column_sort_factors = c("genotype", "treatment"),
+                            return_genes = T, 
+                            tidy_go = T,
+                            customAnno = mouse_conv,
+                            annoJoinCol = "ensembl_gene_id",
+                            breaks = seq(-3, 3, length.out=101),
+                            show_rownames = T)
+
+write.csv(il1_kmeans$genes, "~/Prakriya_Orai1_astro/data/220520_kmeans_gene_assignments_il1_response.csv")
+write.csv(il1_kmeans$GO, "~/Prakriya_Orai1_astro/data/220520_kmeans_cluter_GO_il1_response.csv")
+CairoPDF("~/Prakriya_Orai1_astro/data/220520_kmeans_plot_il1_response_detected.pdf",
+    width = 9,
+    height = 9,
+    family = "Arial")
+il1_kmeans$plot
+dev.off()
+```
+      
+# GSEA   
+## Just IL-1 response   
+```{r}
+duplicated_ids = mouse_conv$external_gene_name[duplicated(mouse_conv$external_gene_name)]
+
+interaction_ranks = id_convert(interaction_res, custom_annotation = mouse_conv) %>% 
+  dplyr::filter(!is.na(stat) & ! (external_gene_name %in% duplicated_ids)) %>% 
+  dplyr::select(external_gene_name, stat) %>% 
+  dplyr::arrange(desc(stat)) %>% 
+  deframe()
+
+set.seed(12345)
+il1_gsea = fgseaMultilevel(pathways = list("GO:0071347" = il1_response$external_gene_name),
+                 stats = interaction_ranks, nproc = 1)
+plotEnrichment(pathway = il1_response$external_gene_name,
+                 stats = interaction_ranks)
+```   
+   
+Suggests fairly balanced response   
+   
+## All hallmark gene sets   
+### Download MSigDB and parse   
+```{bash eval=false}
+cd '/projects/b1038/Pulmonary/rgrant/resources'
+wget 'https://data.broadinstitute.org/gsea-msigdb/msigdb/release/7.5.1/h.all.v7.5.1.symbols.gmt' -O 'h.all.v7.5.1.symbols.gmt'
+```
+
+```{r}
+hallmark = gmtPathways("/projects/b1038/Pulmonary/rgrant/resources/h.all.v7.5.1.symbols.gmt")
+```   
+   
+### Get mouse orthologs   
+```{r}
+orthology = getBM(attributes = c("ensembl_gene_id", "hsapiens_homolog_associated_gene_name", "external_gene_name"),
+                  mart = mouse_mart) %>% 
+  dplyr::filter(!is.na(hsapiens_homolog_associated_gene_name) &
+                  hsapiens_homolog_associated_gene_name != "" & 
+                  !is.na(external_gene_name) &
+                  external_gene_name != "")
+
+hallmark_mouse = lapply(hallmark, function(set){
+  mouse_genes = data.frame(hsapiens_homolog_associated_gene_name = set) %>% 
+    left_join(., orthology, na.matchs = "never", by = "hsapiens_homolog_associated_gene_name") %>% 
+    .$external_gene_name %>% 
+    unique()
+  return(mouse_genes) })
+```
+
+   
+### Run unbiased enrichment on interaction hits   
+```{r}
+set.seed(12345)
+hallmark_gsea = fgseaMultilevel(pathways = hallmark_mouse, stats = interaction_ranks, nproc = 1)
+```   
+   
+### Tidy the results   
+```{r}
+hallmark_gsea_tidy = hallmark_gsea %>% 
+  dplyr::filter(padj < 0.05) %>% 
+  rowwise() %>% 
+  dplyr::mutate(leadingEdge = paste(leadingEdge, collapse = "; ")) %>% 
+  ungroup() %>% 
+  dplyr::arrange(desc(NES))
+
+write.csv(hallmark_gsea_tidy, "~/Prakriya_Orai1_astro/data/220228_hallmark_pathways_gsea.csv")
+```
+   
+### Plot top hits   
+   
+Notch signaling   
+```{r}
+set.seed(12345)
+plotEnrichment(pathway = hallmark_mouse$HALLMARK_NOTCH_SIGNALING,
+                 stats = interaction_ranks)
+```
+      
+Fatty acid metabolism   
+```{r}
+set.seed(12345)
+plotEnrichment(pathway = hallmark_mouse$HALLMARK_FATTY_ACID_METABOLISM,
+                 stats = interaction_ranks)
+```
+
+## All reactome gene sets   
+### Download MSigDB and parse   
+```{bash eval=false}
+cd '/projects/b1038/Pulmonary/rgrant/resources'
+wget 'https://data.broadinstitute.org/gsea-msigdb/msigdb/release/7.5.1/c2.cp.reactome.v7.5.1.symbols.gmt' -O 'c2.cp.reactome.v7.5.1.symbols.gmt'
+```
+
+```{r}
+reactome = gmtPathways("/projects/b1038/Pulmonary/rgrant/resources/c2.cp.reactome.v7.5.1.symbols.gmt")
+```   
+   
+### Get mouse orthologs   
+```{r}
+reactome_mouse = lapply(reactome, function(set){
+  mouse_genes = data.frame(hsapiens_homolog_associated_gene_name = set) %>% 
+    left_join(., orthology, na.matchs = "never", by = "hsapiens_homolog_associated_gene_name") %>% 
+    .$external_gene_name %>% 
+    unique()
+  return(mouse_genes) })
+```
+
+   
+### Run unbiased enrichment on interaction hits   
+```{r}
+set.seed(12345)
+reactome_gsea = fgseaMultilevel(pathways = reactome_mouse, stats = interaction_ranks, nproc = 1)
+```   
+   
+### Tidy the results   
+```{r}
+reactome_gsea_tidy = reactome_gsea %>% 
+  dplyr::filter(padj < 0.05) %>% 
+  rowwise() %>% 
+  dplyr::mutate(leadingEdge = paste(leadingEdge, collapse = "; ")) %>% 
+  ungroup() %>% 
+  dplyr::arrange(desc(NES))
+
+write.csv(reactome_gsea_tidy, "~/Prakriya_Orai1_astro/data/220301_reactome_pathways_gsea.csv")
+```
+   
+### Plot top hits   
+   
+Il1 signaling      
+```{r}
+set.seed(12345)
+il1_gsea = plotEnrichment(pathway = reactome_mouse$REACTOME_INTERLEUKIN_1_FAMILY_SIGNALING,
+                 stats = interaction_ranks)
+
+il1_gsea
+
+CairoPDF("~/Prakriya_Orai1_astro/data/220308_il1_gsea.pdf",
+    width = 6,
+    height = 4,
+    family = "Arial")
+il1_gsea
+dev.off()
+```
+      
+IFN-stimulated expression      
+```{r}
+set.seed(12345)
+ifn_gsea = plotEnrichment(pathway = reactome_mouse$REACTOME_ANTIVIRAL_MECHANISM_BY_IFN_STIMULATED_GENES,
+                 stats = interaction_ranks)
+
+ifn_gsea
+
+CairoPDF("~/Prakriya_Orai1_astro/data/220308_IFN_gsea.pdf",
+    width = 6,
+    height = 4,
+    family = "Arial")
+ifn_gsea
+dev.off()
+```
+   
+HSR   
+```{r}
+set.seed(12345)
+plotEnrichment(pathway = reactome_mouse$REACTOME_CELLULAR_RESPONSE_TO_HEAT_STRESS,
+                 stats = interaction_ranks)
+```
+   
+Glycolysis   
+```{r}
+set.seed(12345)
+glycolysis_gsea = plotEnrichment(pathway = reactome_mouse$REACTOME_GLYCOLYSIS,
+                 stats = interaction_ranks)
+
+glycolysis_gsea
+
+CairoPDF("~/Prakriya_Orai1_astro/data/220308_glycolysis_gsea.pdf",
+    width = 6,
+    height = 4,
+    family = "Arial")
+glycolysis_gsea
+dev.off()
+```
+   
+NFKB survival   
+```{r}
+set.seed(12345)
+nfkb_survival_gsea = plotEnrichment(pathway = reactome_mouse$REACTOME_NF_KB_IS_ACTIVATED_AND_SIGNALS_SURVIVAL,
+                 stats = interaction_ranks)
+
+nfkb_survival_gsea
+
+CairoPDF("~/Prakriya_Orai1_astro/data/220308_nfkb_survival_gsea.pdf",
+    width = 6,
+    height = 4,
+    family = "Arial")
+nfkb_survival_gsea
+dev.off()
+```
+   
+ROS and RNS   
+```{r}
+set.seed(12345)
+ros_rns_gsea = plotEnrichment(pathway = reactome_mouse$REACTOME_ROS_AND_RNS_PRODUCTION_IN_PHAGOCYTES,
+                              stats = interaction_ranks)
+
+ros_rns_gsea
+
+CairoPDF("~/Prakriya_Orai1_astro/data/220523_ros_rns_gsea_phagocytes.pdf",
+    width = 6,
+    height = 4,
+    family = "Arial")
+ros_rns_gsea
+dev.off()
+```
+   
+# Il11 signaling   
+## Single gene expression 
+```{r}
+il11_counts = get_tidy_counts(dge, goi = c("Il11"), custom_annotation = mouse_conv, goi_format = "external_gene_name")
+
+ggplot(il11_counts, aes(x = combined, y = counts, fill= combined)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.2) +
+  facet_wrap(~ external_gene_name, scales = "free_y") +
+  #scale_y_log10() +
+  theme_bw() +
+  theme(legend.position = "none") +
+  scale_fill_npg() +
+  labs(x = "Group", y = "Gene Counts")
+```
+   
+Really low expression, and frankly not terribly different. Better to look at response?   
+   
+## IL11 response gene expression   
+### Make metagene   
+```{r}
+il11_response = getBM(attributes = c("ensembl_gene_id", "external_gene_name"),
+                     filters = "go",
+                     values = "GO:0071348", 
+                     mart = mouse_mart) %>% 
+  #remove un-annotated genes
+  dplyr::filter(!grepl("^Gm\\d+", external_gene_name))
+```   
+   
+Only 1 annotated gene   
+   
+```{r}
+il11_counts = get_tidy_counts(dge, goi = c("Il11", il11_response$external_gene_name), custom_annotation = mouse_conv, goi_format = "external_gene_name")
+
+ggplot(il11_counts, aes(x = combined, y = counts, fill= combined)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.2) +
+  facet_wrap(~ external_gene_name, scales = "free_y") +
+  #scale_y_log10() +
+  theme_bw() +
+  theme(legend.position = "none") +
+  scale_fill_npg() +
+  labs(x = "Group", y = "Gene Counts")
+```
+   
+## Calcium-responsive genes   
+### Get gene list and counts   
+```{r}
+calcium_signaling = getBM(attributes = c("ensembl_gene_id", "external_gene_name"),
+                     filters = "go",
+                     values = "GO:0019722 ", 
+                     mart = mouse_mart) %>% 
+  #remove un-annotated genes
+  dplyr::filter(!grepl("^Gm\\d+", external_gene_name))
+
+calcium_signaling_counts = counts(dge, normalized = T) %>% 
+  as_tibble(rownames = NA) %>% 
+  rownames_to_column("ensembl_gene_id") %>% 
+  right_join(calcium_signaling) %>% 
+  pivot_longer(cols = starts_with("MP_"),
+               names_to = "sample",
+               values_to = "counts") %>% 
+  left_join(., md)
+```   
+      
+### Heatmap of all detected calcium-responsive genes   
+```{r}
+calcium_signaling_mat = calcium_signaling_counts %>% 
+  dplyr::filter(ensembl_gene_id %in% rownames(lrt_hits)) %>% 
+  dplyr::arrange(desc(genotype), desc(treatment)) %>% 
+  pivot_wider(id_cols = external_gene_name, names_from = sample, values_from = counts) %>% 
+  column_to_rownames("external_gene_name") %>% 
+  #filter to expressed genes
+  dplyr::filter(rowMeans(., na.rm = T) >= 5) %>% 
+  data.matrix()
+
+calcium_signaling_md = md_final %>% 
+  dplyr::select(genotype, treatment)
+
+calcium_signaling_hm = pheatmap(mat = calcium_signaling_mat,
+                           clustering_method = "ward.D2",
+                           scale = "row",
+                           cluster_cols = F,
+                           show_colnames = F,
+                           show_rownames = T,
+                           color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(101),
+                           breaks = seq(-3, 3, length.out=101),
+                           annotation_col = calcium_signaling_md)
+
+CairoPDF("~/Prakriya_Orai1_astro/data/220308_combined_calcium_signaling_hits.pdf",
+    width = 9,
+    height = 6,
+    family = "Arial")
+calcium_signaling_hm
+dev.off()
+```
+   
+## IL-1 responsive genes, reactome   
+### Heatmap of all expressed genes in IL1 response   
+```{r}
+il1_reactome_counts = get_tidy_counts(dge, goi = reactome_mouse$REACTOME_INTERLEUKIN_1_FAMILY_SIGNALING, 
+                                      goi_format = "external_gene_name", custom_annotation = mouse_conv)
+
+il1_reactome_mat = il1_reactome_counts %>% 
+  dplyr::filter(ensembl_gene_id %in% expressed_genes) %>% 
+  dplyr::arrange(desc(genotype), desc(treatment)) %>% 
+  pivot_wider(id_cols = external_gene_name, names_from = sample, values_from = counts) %>% 
+  column_to_rownames("external_gene_name") %>% 
+  data.matrix()
+
+il1_reactome_md = md_final %>% 
+  dplyr::select(genotype, treatment)
+
+il1_reactome_hm = pheatmap(mat = il1_reactome_mat,
+                           clustering_method = "ward.D2",
+                           scale = "row",
+                           cluster_cols = F,
+                           show_colnames = F,
+                           show_rownames = T,
+                           color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(101),
+                           breaks = seq(-3, 3, length.out=101),
+                           annotation_col = il1_reactome_md)
+
+CairoPDF("~/Prakriya_Orai1_astro/data/220426_IL1_reactome_expressed.pdf",
+    width = 12,
+    height = 16,
+    family = "Arial")
+il1_reactome_hm
+dev.off()
+```
+   
+### Heatmap of significantly variable genes (LRT)   
+```{r}
+il1_reactome_mat_lrt = il1_reactome_counts %>% 
+  dplyr::filter(ensembl_gene_id %in% rownames(lrt_hits)) %>% 
+  dplyr::arrange(desc(genotype), desc(treatment)) %>% 
+  pivot_wider(id_cols = external_gene_name, names_from = sample, values_from = counts) %>% 
+  column_to_rownames("external_gene_name") %>% 
+  data.matrix()
+
+il1_reactome_hm_lrt = pheatmap(mat = il1_reactome_mat_lrt,
+                           clustering_method = "ward.D2",
+                           scale = "row",
+                           cluster_cols = F,
+                           show_colnames = F,
+                           show_rownames = T,
+                           color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(101),
+                           breaks = seq(-3, 3, length.out=101),
+                           annotation_col = il1_reactome_md)
+
+CairoPDF("~/Prakriya_Orai1_astro/data/220426_IL1_reactome_LRT.pdf",
+    width = 12,
+    height = 12,
+    family = "Arial")
+il1_reactome_hm_lrt
+dev.off()
+```
+
+   
+# Check for contaminating cells   
+## Marker list   
+```{r}
+markers = c("Rbfox3", "Cux2", "Map2", #general neurons
+            "Slc17a7", "Slc17a6", #excitatory neurons
+            "Slc6a1", #inhibitory neurons
+            "Slc6a3", #dopaminergic neurons
+            "Slc6a4", #serotonergic neurons
+            "Slc18a3", #cholinergic neurons
+            "P2ry12", "Tmem119", "Aif1", "Il1b", "Il6", #microglia
+            "Gfap", "Slc1a3", #astrocytes
+            "Cspg4", #OPCs
+            "Olig1", "Olig2")  #Oligodendrocytes
+```
+   
+## Plot   
+```{r}
+contaminating_counts = get_tidy_counts(dge, goi = markers, custom_annotation = mouse_conv, goi_format = "external_gene_name")
+
+ggplot(contaminating_counts, aes(x = combined, y = counts, fill= combined)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.2) +
+  facet_wrap(~ external_gene_name, scales = "free_y") +
+  #scale_y_log10() +
+  theme_bw() +
+  theme(legend.position = "none") +
+  scale_fill_npg() +
+  labs(x = "Group", y = "Gene Counts")
+```
+   
+Olig1/2 and Map2 appear to be expressed in neonatal astrocytes, so this is fine.   
+      
+# Single genes   
+## NADK   
+```{r}
+nadk = get_tidy_counts(dge, goi = "Nadk", custom_annotation = mouse_conv, goi_format = "external_gene_name")
+write.csv(nadk, "~/Prakriya_Orai1_astro/data/220228_Nadk_counts.csv")
+
+ggplot(nadk, aes(x = combined, y = counts, fill = combined)) +
+   geom_boxplot(outlier.shape = NA) +
+   geom_jitter(width = 0.2) +
+   scale_fill_npg() +
+   theme_bw() +
+   theme(axis.text.x = element_text(angle = 45, hjust=1),
+        legend.position = "none") +
+  labs(x = "", y = "Nadk Counts")
+```
+   
+# Motif analysis   
+## Export hit lists   
+### Load biomart conversions   
+```{r}
+entrez_conv = getBM(attributes = c("ensembl_gene_id", "entrezgene_id"),
+                    mart = mouse_mart)
+```
+   
+### Export hits for HOMER   
+```{r eval=FALSE}
+#treatment, up
+treatment_up = treatment_res %>% 
+  as.data.frame() %>% 
+  dplyr::filter(padj < 0.05 & log2FoldChange > 0) %>% 
+  rownames_to_column("ensembl_gene_id") %>% 
+  inner_join(., entrez_conv, na_matches = "never") %>% 
+  .$entrezgene_id %>% 
+  na.omit()
+
+write.table(treatment_up, 
+            file = "/home/rag0151/Prakriya_Orai1_astro/data/HOMER/treatment_up_HOMER.txt", quote = F, row.names = F, col.names = F)
+
+#treatment, down
+treatment_down = treatment_res %>% 
+  as.data.frame() %>% 
+  dplyr::filter(padj < 0.05 & log2FoldChange < 0) %>% 
+  rownames_to_column("ensembl_gene_id") %>% 
+  inner_join(., entrez_conv, na_matches = "never") %>% 
+  .$entrezgene_id %>% 
+  na.omit()
+
+write.table(treatment_down, 
+            file = "/home/rag0151/Prakriya_Orai1_astro/data/HOMER/treatment_down_HOMER.txt", quote = F, row.names = F, col.names = F)
+
+#interaction, up 
+interaction_up = interaction_res %>% 
+  as.data.frame() %>% 
+  dplyr::filter(padj < 0.05 & log2FoldChange > 0) %>% 
+  rownames_to_column("ensembl_gene_id") %>% 
+  inner_join(., entrez_conv, na_matches = "never") %>% 
+  .$entrezgene_id %>% 
+  na.omit()
+
+write.table(interaction_up, 
+            file = "/home/rag0151/Prakriya_Orai1_astro/data/HOMER/interaction_up_HOMER.txt", quote = F, row.names = F, col.names = F)
+
+#interaction, down
+interaction_down = interaction_res %>% 
+  as.data.frame() %>% 
+  dplyr::filter(padj < 0.05 & log2FoldChange < 0) %>% 
+  rownames_to_column("ensembl_gene_id") %>% 
+  inner_join(., entrez_conv, na_matches = "never") %>% 
+  .$entrezgene_id %>% 
+  na.omit()
+
+write.table(interaction_down, 
+            file = "/home/rag0151/Prakriya_Orai1_astro/data/HOMER/interaction_down_HOMER.txt", quote = F, row.names = F, col.names = F)
+
+```   
+   
+## Run HOMER   
+```{bash eval=FALSE}
+cd '/home/rag0151/Prakriya_Orai1_astro/data/HOMER/'
+homerFiles=*_HOMER.txt
+module load homer/4.10
+for file in $homerFiles
+do
+  echo $file
+  outDir=`pwd`/${file%_HOMER.txt}_HOMER_results
+  homerString="cd /home/rag0151/Prakriya_Orai1_astro/data/HOMER/
+  findMotifs.pl "$file" mouse "$outDir" -p 4"
+  
+  sbatch -n 4 -N 1 -t 12:00:00 -A b1042 -p genomics --mem=16G --wrap="$homerString"
+  
+  sleep 1
+done
+```   
+   
+## Look at expression of predicted targets   
+   
+Both CREB/bZIP and NFATC1 binding sites appear to be enriched in the downregulated, which makes a lot of sense in the absence of calcium signaling. Let's look at the dynamics of some of their targets.   
+   
+### Import ENCODE target dataset   
+   
+Downloaded from https://maayanlab.cloud/Harmonizome/dataset/ENCODE+Transcription+Factor+Targets   
+   
+```{r}
+tf_targets = gzfile("/home/rag0151/Prakriya_Orai1_astro/data/220309_ENCODE_TF_targets_gene_attribute_matrix.txt.gz") %>% 
+  read.delim(na.strings = c("", "na", "NA")) %>% 
+  .[3:nrow(.), ] %>% 
+  dplyr::rename(hsapiens_homolog_associated_gene_name = X.) %>% 
+  dplyr::select(hsapiens_homolog_associated_gene_name, CREB1, NFATC1) %>% 
+  left_join(., orthology, na_matches = "never") %>% 
+  dplyr::filter(!is.na(external_gene_name) & !is.na(ensembl_gene_id))
+
+creb1_genes = tf_targets %>% 
+  dplyr::filter(CREB1 == 1) %>% 
+  dplyr::select(-c(CREB1, NFATC1))
+
+nfatc1_genes = tf_targets %>% 
+  dplyr::filter(NFATC1 == 1) %>% 
+  dplyr::select(-c(CREB1, NFATC1))
+```
+   
+### Plot variable genes   
+   
+CREB1-regulated
+```{r}
+order = md_final %>% 
+  rownames_to_column("sample") %>% 
+  dplyr::select(genotype, treatment, sample) %>% 
+  dplyr::arrange(desc(genotype), desc(treatment)) %>% 
+  .$sample
+
+creb1_mat = counts(dge, normalized = T) %>% 
+  as.data.frame() %>% 
+  dplyr::filter(rownames(.) %in% creb1_genes$ensembl_gene_id &
+                  rownames(.) %in% expressed_genes) %>% 
+  data.matrix() %>% 
+  .[, order]
+
+creb1_md = md_final %>% 
+  dplyr::select(genotype, treatment)
+
+creb1_hm = pheatmap(mat = creb1_mat,
+                           clustering_method = "ward.D2",
+                           scale = "row",
+                           cluster_cols = F,
+                           show_colnames = F,
+                           show_rownames = F,
+                           color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(101),
+                           breaks = seq(-3, 3, length.out=101),
+                           annotation_col = creb1_md)
+
+#output data for closer examination
+creb1_mat[creb1_hm$tree_row$order, ] %>% 
+  as.data.frame() %>% 
+  rownames_to_column("ensembl_gene_id") %>% 
+  left_join(., mouse_conv) %>% 
+  left_join(., interaction_hits, by = c("ensembl_gene_id" = "row.names", "external_gene_name")) %>% 
+  dplyr::relocate(external_gene_name, ensembl_gene_id, baseMean:padj) %>% 
+  write.csv(., "~/Prakriya_Orai1_astro/data/220321_creb1_matrix.csv")
+
+#output just hits
+creb1_mat[intersect(rownames(creb1_mat), interaction_hits$row.names), ] %>% 
+  as.data.frame() %>% 
+  rownames_to_column("ensembl_gene_id") %>% 
+  left_join(., mouse_conv) %>% 
+  left_join(., interaction_hits, by = c("ensembl_gene_id" = "row.names", "external_gene_name")) %>% 
+  dplyr::relocate(external_gene_name, ensembl_gene_id, baseMean:padj) %>% 
+  write.csv(., "~/Prakriya_Orai1_astro/data/220321_creb1_hits.csv")
+
+CairoPDF("~/Prakriya_Orai1_astro/data/220308_combined_creb1_hits.pdf",
+    width = 9,
+    height = 6,
+    family = "Arial")
+creb1_hm
+dev.off()
+```
+   
+NFATC1-regulated
+```{r}
+nfatc1_mat = counts(dge, normalized = T) %>% 
+  as.data.frame() %>% 
+  dplyr::filter(rownames(.) %in% nfatc1_genes$ensembl_gene_id &
+                  rownames(.) %in% expressed_genes) %>% 
+  data.matrix() %>% 
+  .[, order]
+
+nfatc1_mat %>% 
+  as.data.frame() %>% 
+  rownames_to_column("ensembl_gene_id") %>% 
+  left_join(., mouse_conv) %>% 
+  dplyr::relocate(external_gene_name) %>% 
+  dplyr::select(-ensembl_gene_id) %>% 
+  write.csv(., "~/Prakriya_Orai1_astro/data/220321_nfatc1_matrix.csv")
+
+nfatc1_md = md_final %>% 
+  dplyr::select(genotype, treatment)
+
+nfatc1_hm = pheatmap(mat = nfatc1_mat,
+                           clustering_method = "ward.D2",
+                           scale = "row",
+                           cluster_cols = F,
+                           show_colnames = F,
+                           show_rownames = F,
+                           color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(101),
+                           breaks = seq(-3, 3, length.out=101),
+                           annotation_col = nfatc1_md)
+
+#output for closer examination
+nfatc1_mat[nfatc1_hm$tree_row$order, ] %>% 
+  as.data.frame() %>% 
+  rownames_to_column("ensembl_gene_id") %>% 
+  left_join(., mouse_conv) %>% 
+  left_join(., interaction_hits, by = c("ensembl_gene_id" = "row.names", "external_gene_name")) %>% 
+  dplyr::relocate(external_gene_name, ensembl_gene_id, baseMean:padj) %>% 
+  write.csv(., "~/Prakriya_Orai1_astro/data/220321_nfatc1_matrix.csv")
+
+#output just hits
+nfatc1_mat[intersect(rownames(nfatc1_mat), interaction_hits$row.names), ] %>% 
+  as.data.frame() %>% 
+  rownames_to_column("ensembl_gene_id") %>% 
+  left_join(., mouse_conv) %>% 
+  left_join(., interaction_hits, by = c("ensembl_gene_id" = "row.names", "external_gene_name")) %>% 
+  dplyr::relocate(external_gene_name, ensembl_gene_id, baseMean:padj) %>% 
+  write.csv(., "~/Prakriya_Orai1_astro/data/220321_nfatc1_hits.csv")
+
+CairoPDF("~/Prakriya_Orai1_astro/data/220308_combined_nfatc1_hits.pdf",
+    width = 9,
+    height = 6,
+    family = "Arial")
+nfatc1_hm
+dev.off()
+```   
+   
+# Data output   
+## Individual gene counts   
+### Orai1   
+```{r}
+orai1_counts = get_tidy_counts(dge, goi = "Orai1", goi_format = "external_gene_name", custom_annotation = mouse_conv)
+write.csv(orai1_counts, "~/Prakriya_Orai1_astro/data/220920_Orai1_counts.csv")
+```
+   
+## Gene lists   
+### NFAT targets   
+```{r}
+write.csv(nfatc1_genes, "~/Prakriya_Orai1_astro/data/220920_NFATC1_targets_all.csv")
+```
+   
+### CREB targets   
+```{r}
+write.csv(creb1_genes, "~/Prakriya_Orai1_astro/data/220920_CREB1_targets_all.csv")
+```   
+   
+## Reviewer cherry-picks   
+### Get all significant comparisons for all genes   
+```{r}
+all_res = get_pairwise_DESeq(dge, comparison_col = "combined", fit_type = "local", 
+                             save_csv = F, save_pdf = F, df_output = T, cores = 8, 
+                             convert_ids = T, custom_annotation = mouse_conv)
+
+all_hits = lapply(names(all_res$hits), function(comp){
+  df = all_res$hits[[comp]] %>% 
+    dplyr::mutate(comparison = comp,
+                  numerator = substring(comparison, 10, 
+                                        regexpr("_over_", comparison) - 1),
+                  denominator = substring(comparison, regexpr("_over_", comparison) + 6)) %>% 
+    dplyr::filter(padj < 0.05)
+  return(df) }) %>% 
+  bind_rows()
+
+max_gene_counts = data.frame(ensembl_gene_id = rownames(dge), max_counts = rowMaxs(counts(dge)))
+
+all_hits = left_join(all_hits, max_gene_counts) %>% 
+  mutate(annot = format(padj, digits = 2, scientific = T))
+```
+
+### Escartin (2021)   
+   
+Boxplots   
+```{r}
+escartin_genes = read.csv("~/Prakriya_Orai1_astro/data/Escartin_2021_MR_genes.csv") %>% 
+  .$Marker
+
+escartin_counts = get_tidy_counts(dge, goi = escartin_genes, 
+                                  goi_format = "external_gene_name", custom_annotation = mouse_conv) %>% 
+  mutate(combined = factor(combined, levels = c("WT untreated", "WT treated", "KO untreated", "KO treated")))
+
+escartin_comps = all_hits %>% 
+  dplyr::filter(external_gene_name %in% escartin_genes) %>% 
+  group_by(external_gene_name) %>% 
+  mutate(yval = seq(from = first(max_counts) * 1.1, by = first(max_counts) * 0.1, length.out = n()),
+         yval_log10 = log10(yval))
+  
+
+escartin_boxplots = ggplot(escartin_counts, aes(x = combined, y = counts, fill = combined)) +
+  facet_wrap(~external_gene_name, scales = "free_y") +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.2) +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_manual(values = pal) +
+  labs(x = "Group", y = "DESeq2-Normalized Counts") +
+  geom_signif(inherit.aes = F, 
+              textsize = 3,
+              data = escartin_comps,
+              aes(xmin = numerator, xmax = denominator, annotations = annot, y_position = yval),
+              tip_length = 0,
+              manual=TRUE) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1)))
+
+CairoPDF("~/Prakriya_Orai1_astro/data/220920_escartin_boxplots.pdf",
+    width = 12,
+    height = 12,
+    family = "Arial")
+escartin_boxplots
+dev.off()
+```   
+   
+z-Scaled heatmap   
+   
+```{r}
+escartin_mat = counts(dge, normalized = T) %>% 
+  as.data.frame() %>% 
+  rownames_to_column("ensembl_gene_id") %>% 
+  left_join(., mouse_conv) %>% 
+  dplyr::filter(external_gene_name %in% escartin_genes &
+                  ensembl_gene_id %in% expressed_genes) %>% 
+  dplyr::select(-ensembl_gene_id) %>% 
+  column_to_rownames("external_gene_name") %>% 
+  data.matrix() %>% 
+  .[, order]
+
+escartin_md = md_final %>% 
+  dplyr::select(genotype, treatment)
+
+escartin_hm = pheatmap(mat = escartin_mat,
+                           clustering_method = "ward.D2",
+                           scale = "row",
+                           cluster_cols = F,
+                           show_colnames = F,
+                           show_rownames = T,
+                           color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(101),
+                           breaks = seq(-3, 3, length.out=101),
+                           annotation_col = escartin_md)
+
+CairoPDF("~/Prakriya_Orai1_astro/data/220921_escartin_heatmap.pdf",
+    width = 9,
+    height = 6,
+    family = "Arial")
+escartin_hm
+dev.off()
+
+escartin_hm
+```   
+   
+### Zamanian (2012)   
+   
+Boxplots   
+   
+```{r}
+zamanian_genes = read.csv("~/Prakriya_Orai1_astro/data/zamanian_2012_list.csv", header = F) %>% 
+  .$V2
+zamanian_counts = get_tidy_counts(dge, goi = zamanian_genes, 
+                                  goi_format = "external_gene_name", custom_annotation = mouse_conv) %>% 
+  mutate(combined = factor(combined, levels = c("WT untreated", "WT treated", "KO untreated", "KO treated")))
+
+zamanian_comps = all_hits %>% 
+  dplyr::filter(external_gene_name %in% zamanian_genes) %>% 
+  group_by(external_gene_name) %>% 
+  mutate(yval = seq(from = first(max_counts) * 1.1, by = first(max_counts) * 0.1, length.out = n()),
+         yval_log10 = log10(yval))
+  
+
+zamanian_boxplots = ggplot(zamanian_counts, aes(x = combined, y = counts, fill = combined)) +
+  facet_wrap(~external_gene_name, scales = "free_y") +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.2) +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_manual(values = pal) +
+  labs(x = "Group", y = "DESeq2-Normalized Counts") +
+  geom_signif(inherit.aes = F, 
+              textsize = 3,
+              data = zamanian_comps,
+              aes(xmin = numerator, xmax = denominator, annotations = annot, y_position = yval),
+              tip_length = 0,
+              manual=TRUE) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1)))
+
+CairoPDF("~/Prakriya_Orai1_astro/data/220920_Zamanian_boxplots.pdf",
+    width = 16,
+    height = 16,
+    family = "Arial")
+zamanian_boxplots
+dev.off()
+```
+   
+z-Scaled heatmap   
+   
+```{r}
+zamanian_mat = counts(dge, normalized = T) %>% 
+  as.data.frame() %>% 
+  rownames_to_column("ensembl_gene_id") %>% 
+  left_join(., mouse_conv) %>% 
+  dplyr::filter(external_gene_name %in% zamanian_genes &
+                  ensembl_gene_id %in% expressed_genes) %>% 
+  dplyr::select(-ensembl_gene_id) %>% 
+  column_to_rownames("external_gene_name") %>% 
+  data.matrix() %>% 
+  .[, order]
+
+zamanian_md = md_final %>% 
+  dplyr::select(genotype, treatment)
+
+zamanian_hm = pheatmap(mat = zamanian_mat,
+                           clustering_method = "ward.D2",
+                           scale = "row",
+                           cluster_cols = F,
+                           show_colnames = F,
+                           show_rownames = T,
+                           color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(101),
+                           breaks = seq(-3, 3, length.out=101),
+                           annotation_col = zamanian_md)
+
+CairoPDF("~/Prakriya_Orai1_astro/data/220921_zamanian_heatmap.pdf",
+    width = 9,
+    height = 9,
+    family = "Arial")
+zamanian_hm
+dev.off()
+
+zamanian_hm
+```   
+   
+### Zamanian, list B   
+   
+Boxplots   
+   
+```{r}
+zamanian_listB_genes = read.csv("~/Prakriya_Orai1_astro/data/Zamanian_list_b.csv", header = F) %>% 
+  .$V2
+zamanian_listB_counts = get_tidy_counts(dge, goi = zamanian_listB_genes, 
+                                  goi_format = "external_gene_name", custom_annotation = mouse_conv) %>% 
+  mutate(combined = factor(combined, levels = c("WT untreated", "WT treated", "KO untreated", "KO treated")))
+
+zamanian_listB_comps = all_hits %>% 
+  dplyr::filter(external_gene_name %in% zamanian_listB_genes) %>% 
+  group_by(external_gene_name) %>% 
+  mutate(yval = seq(from = first(max_counts) * 1.1, by = first(max_counts) * 0.1, length.out = n()),
+         yval_log10 = log10(yval))
+  
+
+zamanian_listB_boxplots = ggplot(zamanian_listB_counts, aes(x = combined, y = counts, fill = combined)) +
+  facet_wrap(~external_gene_name, scales = "free_y") +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.2) +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_manual(values = pal) +
+  labs(x = "Group", y = "DESeq2-Normalized Counts") +
+  geom_signif(inherit.aes = F, 
+              textsize = 3,
+              data = zamanian_listB_comps,
+              aes(xmin = numerator, xmax = denominator, annotations = annot, y_position = yval),
+              tip_length = 0,
+              manual=TRUE) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1)))
+
+CairoPDF("~/Prakriya_Orai1_astro/data/221016_zamanian_listB_boxplots.pdf",
+    width = 20,
+    height = 20,
+    family = "Arial")
+zamanian_listB_boxplots
+dev.off()
+```
+   
+z-Scaled heatmap   
+   
+```{r}
+zamanian_listB_mat = counts(dge, normalized = T) %>% 
+  as.data.frame() %>% 
+  rownames_to_column("ensembl_gene_id") %>% 
+  left_join(., mouse_conv) %>% 
+  dplyr::filter(external_gene_name %in% zamanian_listB_genes &
+                  ensembl_gene_id %in% expressed_genes) %>% 
+  dplyr::select(-ensembl_gene_id) %>% 
+  column_to_rownames("external_gene_name") %>% 
+  data.matrix() %>% 
+  .[, order]
+
+zamanian_listB_md = md_final %>% 
+  dplyr::select(genotype, treatment)
+
+zamanian_listB_hm = pheatmap(mat = zamanian_listB_mat,
+                           clustering_method = "ward.D2",
+                           scale = "row",
+                           cluster_cols = F,
+                           show_colnames = F,
+                           show_rownames = T,
+                           color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(101),
+                           breaks = seq(-3, 3, length.out=101),
+                           annotation_col = zamanian_listB_md)
+
+CairoPDF("~/Prakriya_Orai1_astro/data/221016_zamanian_listB_heatmap.pdf",
+    width = 9,
+    height = 9,
+    family = "Arial")
+zamanian_listB_hm
+dev.off()
+
+zamanian_listB_hm
+```   
+   
+## Orais and Stims   
+### Boxplots   
+```{r}
+orai_stim = get_tidy_counts(dge, goi = c("Orai1", "Orai2", "Orai3", "Stim1", "Stim2"),
+                            goi_format = "external_gene_name", custom_annotation = mouse_conv) %>% 
+  mutate(combined = factor(combined, levels = c("WT untreated", "WT treated", "KO untreated", "KO treated")))
+
+orai_stim_comps = all_hits %>% 
+  dplyr::filter(external_gene_name %in% c("Orai1", "Orai2", "Orai3", "Stim1", "Stim2")) %>% 
+  group_by(external_gene_name) %>% 
+  mutate(yval = seq(from = first(max_counts) * 1.1, by = first(max_counts) * 0.1, length.out = n()),
+         yval_log10 = log10(yval))
+
+orai_stim_boxplots = ggplot(orai_stim, aes(x = combined, y = counts, fill = combined)) +
+  facet_wrap(~external_gene_name, scales = "free_y") +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.2) +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_manual(values = pal) +
+  labs(x = "Group", y = "DESeq2-Normalized Counts") +
+  geom_signif(inherit.aes = F, 
+              textsize = 3,
+              data = orai_stim_comps,
+              aes(xmin = numerator, xmax = denominator, annotations = annot, y_position = yval),
+              tip_length = 0,
+              manual=TRUE) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1)))
+
+orai_stim_boxplots
+
+CairoPDF("~/Prakriya_Orai1_astro/data/221013_Ora1_Stim_boxplots.pdf",
+    width = 10,
+    height = 6,
+    family = "Arial")
+orai_stim_boxplots
+dev.off()
+```
+   
+### Dynamite plots   
+```{r}
+orai_stim_barplots = ggplot(orai_stim, aes(x = combined, y = counts, fill = combined)) +
+  facet_wrap(~external_gene_name, scales = "free_y") +
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.3) +
+  stat_summary(fun = mean, geom = "bar", color = "black", width = 0.8) +
+  geom_jitter(width = 0.2, color = "black", fill = "white", shape = 21) +
+  theme_bw() +
+  theme(legend.position = "none",
+        strip.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_manual(values = pal) +
+  labs(x = "Group", y = "DESeq2-Normalized Counts") +
+  geom_signif(inherit.aes = F, 
+              textsize = 3,
+              data = orai_stim_comps,
+              aes(xmin = numerator, xmax = denominator, annotations = annot, y_position = yval),
+              tip_length = 0,
+              manual=TRUE) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1)))
+
+orai_stim_barplots
+
+CairoPDF("~/Prakriya_Orai1_astro/data/221013_Ora1_Stim_barplots.pdf",
+    width = 10,
+    height = 6,
+    family = "Arial")
+orai_stim_barplots
+dev.off()
+```

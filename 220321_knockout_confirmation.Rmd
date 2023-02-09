@@ -1,0 +1,99 @@
+---
+title: "Orai1 KO confirmation"
+output: html_notebook
+---
+
+# Setup   
+## Goals   
+1. Confirm Orai KO at the exon level (exons 2 and 3 should be absent, 3 exons total)   
+2. Determine if the majority of reads in the knockout are actually just a truncated mRNA with just a single exon (exon 1)   
+   
+## Import packages   
+```{r}
+library(DESeq2)
+library(Rsamtools)
+library(BSgenome.Mmusculus.UCSC.mm10)
+library(BSgenome)
+library(TxDb.Mmusculus.UCSC.mm10.knownGene)
+library(GenVisR)
+```
+
+# Traces of read distribution   
+## Make an Orai1 bed file   
+```{r eval}
+orai1_start = 123015074
+orai1_end = 123030456
+
+orai1_seq = seq(from = orai1_start, to = orai1_end, by = 100) #bins of 100nt
+orai1_bam = data.frame(chrom = rep(5, (length(orai1_seq) - 1)),
+                       start = orai1_seq[1:(length(orai1_seq) - 1)], 
+                       end = orai1_seq[2:(length(orai1_seq))],
+                       name = paste("Orai1", 1:(length(orai1_seq) - 1), sep = "_"),
+                       score = rep(0, (length(orai1_seq) - 1)),
+                       strand = rep(".", (length(orai1_seq) - 1))) #unstranded kit, nothing else in that region
+
+write.table(orai1_bam, 
+            "/projects/b1038/Pulmonary/rgrant/Orai1_KO_Prakriya/results/star_salmon/220321_Orai1_binned.bed",
+            row.names = F,
+            col.names = F,
+            sep = "\t",
+            quote = F)
+```
+
+### Generate coverage data   
+```{bash eval=FALSE}
+module load bedtools/2.29.2
+cd /projects/b1038/Pulmonary/rgrant/Orai1_KO_Prakriya/results/star_salmon
+bams=/projects/b1038/Pulmonary/rgrant/Orai1_KO_Prakriya/results/star_salmon/*.markdup.sorted.bam
+echo $bams > orai1_binned_coverage_order.txt
+
+bedtools multicov -bams $bams -bed 220321_Orai1_binned.bed -S > orai1_binned_coverage.tsv
+```   
+   
+### Make dataset   
+```{r}
+bams = readLines("/projects/b1038/Pulmonary/rgrant/Orai1_KO_Prakriya/results/star_salmon/orai1_binned_coverage_order.txt") %>% 
+  str_split(" ") %>% 
+  unlist() %>% 
+  basename() %>% 
+  gsub(".markdup.sorted.bam", "", .)
+
+coverage = read.delim("/projects/b1038/Pulmonary/rgrant/Orai1_KO_Prakriya/results/star_salmon/orai1_binned_coverage.tsv", 
+                      header = F, 
+                      col.names = c("chrom", "start", "end", "name", "score", "strand", bams)) %>% 
+   dplyr::mutate(chrom = "chr5") %>%  #to fit UCSC nomenclature
+   pivot_longer(cols = 7:ncol(.),
+                names_to = "sample",
+                values_to = "cov") 
+
+coverage_list = lapply(bams, function(s){
+   sub = coverage %>% 
+      dplyr::filter(sample == s)
+   
+   return(sub) })
+names(coverage_list) = bams
+```
+   
+### Organize genome info   
+```{r}
+mm10 = BSgenome.Mmusculus.UCSC.mm10
+tx_db = TxDb.Mmusculus.UCSC.mm10.knownGene
+gr = GRanges(seqnames=c("chr5"), ranges=IRanges(start = orai1_start, end=orai1_end))
+```
+   
+### Plot   
+```{r}
+CairoPDF("~/Prakriya_Orai1_astro/data/220321_Orai1_coverage_plot.pdf", 
+         width = 20,
+         height = 60)
+coverage_plot = genCov(x = coverage_list, 
+       txdb = tx_db, 
+       gr = gr, 
+       genome = mm10, 
+       gene_name = "Orai1",
+       gene_isoformSel = "ENSMUST00000121652.7",
+       cov_plotType="line")
+dev.off()
+```   
+   
+Looks to me like 1) the knockout generally works (by removing exon 2), and that most counts on the KO animals are exon 1 reads. However, there is incomplete knockout of exon 2 in some KO samples.   
